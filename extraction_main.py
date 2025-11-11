@@ -12,6 +12,8 @@ from concurrent.futures import ProcessPoolExecutor
 import cv2
 from PIL import Image
 
+
+
 # We need to import the I3D model definition from the cloned repo
 # Add the repo to our Python path (assuming it's in the same dir)
 sys.path.append('pytorch-i3d')
@@ -424,10 +426,10 @@ def run_flow_feature_extraction(args, device):
 
 
 # --- STAGE 4: FEATURE COMBINATION ---
-# --- (No changes needed for this stage) ---
+# --- THIS FUNCTION IS NOW MODIFIED ---
 
 def run_feature_combination(args):
-    """Pipeline Stage 4: Combine RGB and Flow features."""
+    """Pipeline Stage 4: Combine RGB and Flow features with alignment padding."""
     print("\n--- [Starting Stage 4: Feature Combination] ---")
     
     os.makedirs(args.combined_feat_dir, exist_ok=True)
@@ -453,29 +455,70 @@ def run_feature_combination(args):
             continue
             
         try:
-            rgb_feats = np.load(rgb_path)  # Shape (1024, T1)
-            flow_feats = np.load(flow_path) # Shape (1024, T2)
+            rgb_feats = np.load(rgb_path)  # Shape (1024, T_rgb_feat), e.g. (1024, 2362)
+            flow_feats = np.load(flow_path) # Shape (1024, T_flow_feat), e.g. (1024, 2361)
         except Exception as e:
             print(f"  - ERROR: Could not load {basename}. {e}")
             total_skipped += 1
             continue
 
-        # --- FIX: Check (D, T) format ---
-        if rgb_feats.shape[0] != 1024 or flow_feats.shape[0] != 1024:
-            print(f"  - WARNING: Skipping {basename}. Incorrect feature dim.")
-            print(f"    RGB shape: {rgb_feats.shape}, Flow shape: {flow_feats.shape}")
-            total_skipped += 1
-            continue
+        # --- START: PADDING AND ALIGNMENT FIX ---
         
-        # Align temporally by truncating to the minimum T
-        min_t = min(rgb_feats.shape[1], flow_feats.shape[1])
+        # 1. Define the window size from your extraction args
+        CHUNK_SIZE = args.chunk_size # e.g., 16
+
+        # 2. Calculate the original GT length from the RGB features
+        # T_gt = T_rgb_feat + CHUNK_SIZE - 1
+        # e.g. 2377 = 2362 + 16 - 1
+        gt_length = rgb_feats.shape[1] + CHUNK_SIZE - 1
+
+        # 3. Pad RGB features
+        # We need to pad (T_gt - T_rgb_feat) = 15 frames
+        pad_front_rgb = (CHUNK_SIZE - 1) // 2  # 7
+        pad_back_rgb = CHUNK_SIZE // 2        # 8
         
-        rgb_feats = rgb_feats[:, :min_t]
-        flow_feats = flow_feats[:, :min_t]
+        # Apply 'edge' padding to (1024, T_rgb_feat)
+        rgb_padded = np.pad(
+            rgb_feats,
+            pad_width=((0, 0), (pad_front_rgb, pad_back_rgb)), # Pad on axis 1 (time)
+            mode='edge' 
+        )
         
-        # Concatenate along the feature dimension (axis=0)
-        # (1024, T) + (1024, T) -> (2048, T)
-        combined_feats = np.concatenate([rgb_feats, flow_feats], axis=0)
+        # 4. Pad Flow features
+        # We need to pad (T_gt - T_flow_feat) = 16 frames
+        # We split this 8/8 to align with the RGB features
+        
+        TOTAL_PADDING_NEEDED = gt_length - flow_feats.shape[1] # e.g., 2377 - 2361 = 16
+        
+        pad_front_flow = TOTAL_PADDING_NEEDED // 2             # 16 // 2 = 8
+        pad_back_flow = TOTAL_PADDING_NEEDED - pad_front_flow  # 16 - 8 = 8
+        
+        flow_padded = np.pad(
+            flow_feats,
+            pad_width=((0, 0), (pad_front_flow, pad_back_flow)), # Pad on axis 1 (time)
+            mode='edge'
+        )
+        
+        # 5. Safety check: Trim to exact gt_length
+        # (e.g., if padding was off by one, this fixes it)
+        if rgb_padded.shape[1] > gt_length:
+            rgb_padded = rgb_padded[:, :gt_length]
+        if flow_padded.shape[1] > gt_length:
+            flow_padded = flow_padded[:, :gt_length]
+            
+        # At this point, both should be (1024, 2377)
+        
+        if rgb_padded.shape[1] != flow_padded.shape[1]:
+             print(f"  - WARNING: Skipping {basename}. Final padded shapes mismatch.")
+             print(f"    RGB: {rgb_padded.shape}, Flow: {flow_padded.shape}")
+             total_skipped += 1
+             continue
+        
+        # 6. Concatenate along the feature dimension (axis=0)
+        # (1024, T_gt) + (1024, T_gt) -> (2048, T_gt)
+        combined_feats = np.concatenate([rgb_padded, flow_padded], axis=0)
+        
+        # --- END: PADDING AND ALIGNMENT FIX ---
         
         output_path = os.path.join(args.combined_feat_dir, basename)
         np.save(output_path, combined_feats)
@@ -490,11 +533,21 @@ def run_feature_combination(args):
 
 def main(args):
     # Setup Device
-    if args.device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available. Falling back to CPU.")
-        device = torch.device('cpu')
+    # --- MODIFIED: Auto-detect MPS for Mac ---
+    if args.device == 'cuda' and torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif args.device == 'mps' and torch.backends.mps.is_available():
+        device = torch.device('mps')
     else:
-        device = torch.device(args.device)
+        if torch.backends.mps.is_available():
+            device = torch.device('mps')
+            print("CUDA not available. Falling back to MPS.")
+        elif torch.cuda.is_available():
+            device = torch.device('cuda')
+            print("MPS not available. Falling back to CUDA.")
+        else:
+            device = torch.device('cpu')
+            print("CUDA and MPS not available. Falling back to CPU.")
     print(f"Using device: {device}")
 
     # Define all output paths from the single output_dir
@@ -507,17 +560,14 @@ def main(args):
     
     # Stage 1: Preprocessing (Read video, save frames/flow)
     if args.run_all or args.run_preprocessing:
-        # This is the old 'run_flow_generation'
         run_flow_generation(args) 
         
     # Stage 2: RGB Extraction (Read 'img' frames)
     if args.run_all or args.run_rgb_extraction:
-        # This is the new 'run_rgb_extraction'
         run_rgb_extraction(args, device)
         
     # Stage 3: Flow Extraction (Read 'flow_x/y' frames)
     if args.run_all or args.run_flow_extraction:
-        # This is the old 'run_flow_feature_extraction'
         run_flow_feature_extraction(args, device)
         
     # Stage 4: Combine Features
@@ -527,18 +577,18 @@ def main(args):
     print("\n--- Pipeline Finished ---")
 
 if __name__ == '__main__':
+    # --- REVERTED TO argparse ---
     parser = argparse.ArgumentParser(description="Full I3D Feature Extraction Pipeline (RGB + Flow)")
     
     # --- General Paths ---
     parser.add_argument('--video_dir', type=str, default='videos',
                         help="Directory containing your .mp4 videos.")
-    parser.add_argument('--model_rgb', type=str, default='rgb_imagenet.pt',
+    parser.add_argument('--model_rgb', type=str, default='models/rgb_imagenet.pt',
                         help="Path to the pre-trained I3D RGB model (.pt file).")
-    parser.add_argument('--model_flow', type=str, default='flow_imagenet.pt',
+    parser.add_argument('--model_flow', type=str, default='models/flow_imagenet.pt',
                         help="Path to the pre-trained I3D Flow model (.pt file).")
 
     # --- Directory Outputs (Defaults) ---
-    # --- FIXED: Use the single output_dir ---
     parser.add_argument('--output_dir', type=str, default='pipeline_output',
                         help="Main directory to save all outputs (raw data and features).")
 
@@ -547,18 +597,18 @@ if __name__ == '__main__':
     parser.add_argument('--run-preprocessing', action='store_true', help="Stage 1: Read video, save frames/flow.")
     parser.add_argument('--run-rgb-extraction', action='store_true', help="Stage 2: Extract RGB features from frames.")
     parser.add_argument('--run-flow-extraction', action='store_true', help="Stage 3: Extract Flow features from frames.")
-    parser.add_argument('--run-combine', action='store_true', help="Stage 4: Combine RGB and Flow features.")
+    parser.add_argument('--run-combine', action='store_true', help="Stage 4: Combine features.")
     parser.add_argument('--overwrite', action='store_true', help="Overwrite existing feature/flow files.")
 
     # --- Extraction Parameters ---
     parser.add_argument('--chunk_size', type=int, default=16,
                         help="Number of frames in each chunk (T).")
-    parser.add_argument('--stride', type=int, default=16,
+    parser.add_argument('--stride', type=int, default=1,
                         help="Number of frames to slide the window. Default 16 (non-overlapping).")
     parser.add_argument('--batch_size', type=int, default=32,
                         help="Number of chunks to process at a time (to prevent OOM).")
     parser.add_argument('--device', type=str, default='cuda',
-                        help="Device to use ('cpu', 'cuda'). Default: 'cuda'")
+                        help="Device to use ('cpu', 'cuda', 'mps'). Default: 'cuda'")
     
     # --- Flow Gen Parameters ---
     parser.add_argument('--flow_bound', type=int, default=20,
@@ -568,7 +618,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # --- FIXED: Added parser.print_help() and exit(1) ---
     if not (args.run_all or args.run_preprocessing or args.run_rgb_extraction or args.run_flow_extraction or args.run_combine):
         print("Error: No action specified. Please add one of:")
         print("  --run-all")
